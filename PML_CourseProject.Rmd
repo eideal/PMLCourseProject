@@ -1,0 +1,163 @@
+---
+title: "Practical Machine Learning Course Project: Classifying Exercise Quality with Fitness Monitors"
+author: Emma Ideal
+date: 16 Aug 2015
+output:
+  html_document:
+    pandoc_args: [
+      "+RTS", "-K64m",
+      "-RTS"
+    ]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health or find patterns in their behavior. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, we use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants who were asked to perform barbell lifts correctly and incorrectly in 5 different ways. The goal is to train a classification model for this variable and correctly identify which of these 5 modes were used on a new set of data. The data for this project come from this source: [http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har). 
+
+Random forest and gradient boosting models are trained. The out-of-sample error rate produced by the random forest model is lower (< 1%) than that for the GBM (4%), though ultimately, applying both models on the testing set of interest results in the same classification predictions. 
+
+### Loading the Data
+
+```{r}
+if(!file.exists('pml-training.csv')){
+        download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv', destfile='pml-training.csv', method='curl')
+}
+if(!file.exists('pml-testing.csv')){
+        download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv', destfile='pml-testing.csv', method='curl')
+}
+```
+
+```{r}
+if(!exists('training')){
+        training <- read.csv('pml-training.csv', na.strings='NA')
+}
+if(!exists('testing')){
+        testing <- read.csv('pml-testing.csv', na.strings='NA')
+}
+```
+
+### Data Cleaning
+I first remove the first seven columns of the data frame as possibilities for predictors since these variables are not directly related to the exercise performance:
+
+```{r}
+training <- training[, -(1:7)]
+dim(training)
+```
+
+Next, if a column in the training set is dominated by missing values, it may have limited power as a predictor. Exploratory data analysis shows that columns in this dataset containing NAs are populated by > 90% NAs. I will neglect all of these predictors in model building.
+
+```{r}
+NA_columns <- sapply(training, function(x) mean(is.na(x))) > 0.9 # Note this could have been 0.5 and the result would be the same
+training <- training[, NA_columns==FALSE]
+print(paste0('Number of columns left: ', ncol(training)))
+```
+
+Finally, I remove columns that have near zero variance since these will not be useful in prediction:
+
+```{r, message=FALSE}
+library(caret)
+nsv <- nearZeroVar(training, saveMetrics=TRUE)
+training <- training[,nsv$nzv==FALSE]
+print(paste0('Number of columns left: ', ncol(training)))
+```
+
+### Splitting into Training and Testing Samples
+I take the training set and divide this into training (70%) and testing (30%) sets so I can evaluate my models' out-of-sample error rate:
+```{r}
+set.seed(42)
+inTrain   <- createDataPartition(y=training$classe, p=0.7, list=FALSE)
+new_train <- training[inTrain,]
+new_test  <- training[-inTrain,]
+```
+
+It is important to check that there are sufficient statistics for each of the 5 types of exercise classe we are using as the outcome.
+
+```{r, message=FALSE}
+library(lattice)
+barchart(new_train$classe, xlab='Freq in Training Set', ylab='classe', col='blue')
+```
+
+There is a relatively democratic representation in the classe types.
+
+### Model Building: Gradient Boosting with Classification Trees
+First, I'll try training boosted decision trees, without any variable preprocessing, to classify the exercise type. I use 4-fold cross-validation to estimate the out-of-sample error rate.
+
+```{r, cache=TRUE, message=FALSE}
+set.seed(93021)
+trCl <- trainControl(method='cv', number=4, verboseIter=FALSE, allowParallel=TRUE)
+modGBM <- train(classe ~ ., method='gbm', verbose=FALSE, data=new_train, distribution='multinomial', trControl=trCl)
+mean(modGBM$resample$Accuracy)
+```
+
+The expected out-of-sample error rate is 1 minus the mean accuracy over the cross validation folds, or 4%. We can verify this by using the GBM model to predict on the **new_test** testing set:
+
+```{r, message=FALSE}
+pred_GBM <- predict(modGBM, new_test)
+confusionMatrix(pred_GBM, new_test$classe)
+```
+
+The accuracy of the model on this independent testing set is 96%, or in other words, the measured error rate is 4%.
+
+### Model Building: Random Forest
+We will try to outperform the gradient boosting model by training a random forest. Random forests are known to be one of the best algorithms for obtaining high accuracy in classification problems. Here I can use 4-fold cross validation on the **new_train** training set to obtain a measure of the out-of-sample error rate. However, random forests also internally produce a measure of the out-of-sample error rate, called the out-of-bag (OOB) error rate. Some training samples are left out in the construction of each tree in the forest. These samples are then run down each tree. The sum of the proportion of incorrect predictions for each sample divided by the total number of samples is equal to the out-of-bag error rate. This is expected to be an unbiased measure of the error rate on a new dataset.
+
+```{r, cache=TRUE, message=FALSE}
+set.seed(91516)
+modRF <- train(classe ~ ., method='rf', data=new_train, trControl=trCl)
+```
+
+We can print the final model to see some of the training details:
+
+```{r, cache=TRUE}
+modRF$finalModel
+```
+
+The random forest trained 500 trees, randomly selecting 2 out of our 52 total predictor variables at each node for splitting. The out-of-bag estimate of the error rate is 0.68%, which is impressive. To verify this error rate, I can use the trained random forest to predict on the **new_test** dataset. Given the out-of-bag error estimate, I expect this accuracy to be around 100 - 0.68 = 99.32%.
+
+```{r, message=FALSE}
+pred_RF <- predict(modRF, new_test)
+confusionMatrix(pred_RF, new_test$classe)
+```
+
+The accuracy on this testing set is 99.39%, outperforming the gradient boosting model.
+
+We can also take a look at the order of variable importance for the random forest model. The variable importance is computed by taking the out-of-bag samples for each tree (i.e. the samples not used in tree construction), taking a random permutation of the predictor variable value and putting these new OOB samples down each tree in the forest. The difference between the number of votes for the correct class in the variable-permuted OOB data and the number of votes in the original OOB data is the importance score for that variable. It is a measure of how sensitive the forest prediction is on the value of that particular variable.
+
+```{r}
+plot(varImp(modRF))
+```
+
+### Retraining with the Full Training Set
+The trained random forest has a lower expected error rate for prediction on new data. We will use this to predict on the submission test set, but it is first important to train on the full statistics of the original training set.
+
+```{r, cache=TRUE, message=FALSE}
+set.seed(1280)
+trCl  <- trainControl(method='cv', number=4, verboseIter=FALSE, allowParallel=TRUE)
+finRF <- train(classe ~ ., method='rf', data=training, trControl=trCl)
+```
+
+### Prediction on the Submission Test Set
+The submission test set contains 20 new data samples. It is found that both my trained gradient boosting and random forest models result in equivalent predictions on the 20-sample submission test set:
+
+```{r}
+pred_finRF  <- predict(finRF, testing)
+pred_testGBM <- predict(modGBM, testing)
+pred_finRF == pred_testGBM
+```
+
+I then write my predictions to individual files for submission.
+
+```{r}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(pred_finRF)
+```
